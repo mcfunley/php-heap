@@ -1,6 +1,21 @@
 import gdb
 import sys
 
+
+datatypes = {
+    0: 'null',
+    1: 'long', 
+    2: 'double',
+    3: 'bool',
+    4: 'array',
+    5: 'object',
+    6: 'string',
+    7: 'resource',
+    8: 'constant',
+    9: 'constant_array',
+    }
+
+
 zend_mm_alignment = 8
 zend_mm_alignment_mask = ~(zend_mm_alignment - 1)
 
@@ -10,6 +25,13 @@ block_type = gdb.lookup_type('zend_mm_block')
 voidptr_type = gdb.lookup_type('void').pointer()
 charptr_type = gdb.lookup_type('char').pointer()
 blockptr_type = block_type.pointer()
+
+object_type = gdb.lookup_type('zend_object')
+objectptr_type = object_type.pointer()
+
+zval_type = gdb.lookup_type('zval')
+zvalptr_type = zval_type.pointer()
+
 
 
 def blockptr(x):
@@ -22,6 +44,10 @@ def charptr(x):
 
 def voidptr(x):
     return x.cast(voidptr_type)
+
+
+def objptr(x):
+    return x.cast(objectptr_type)
 
 
 def zend_mm_aligned_size(size):
@@ -75,7 +101,6 @@ def zend_mm_is_guard_block(blockptr):
 
 
 
-
 class PHPHeapDiag(gdb.Command):
     def __init__(self):
         gdb.Command.__init__(self, 'php-heap-diag', gdb.COMMAND_DATA) 
@@ -88,6 +113,9 @@ class PHPHeapDiag(gdb.Command):
         self.used_block_count = 0
         self.used_space = 0
         self.fragmentation_space = 0
+        self.largest_free_block = 0
+        self.zval_counts = {}
+        self.class_counts = {}
 
 
     def invoke(self, arg, from_tty):
@@ -96,6 +124,7 @@ class PHPHeapDiag(gdb.Command):
         self.frame = gdb.selected_frame()
         alloc_globals = self.frame.read_var('alloc_globals')
         self.heap = alloc_globals['mm_heap'].dereference()
+        self.eg = self.frame.read_var('executor_globals')
 
         self.visit_all_blocks()
 
@@ -107,10 +136,28 @@ class PHPHeapDiag(gdb.Command):
         print 'Block count:', self.block_count
         print 'Free blocks:', self.free_block_count
         print 'Free space:', self.human_size_bytes(self.free_space)
+        print 'Largest free block:', self.human_size_bytes(
+            self.largest_free_block)
         print 'Used blocks:', self.used_block_count
         print 'Used space:', self.human_size_bytes(self.used_space)
         print 'Fragmentation loss:', self.human_size_bytes(
             self.fragmentation_space)
+        print
+        print 'Instance counts:'
+        self.print_counts(self.class_counts)
+        print
+        print 'zval types:'
+        self.print_counts(self.zval_counts)
+
+
+    def print_counts(self, d):
+        cs = [(n, c) for n, c in d.items()]
+        i = 0
+        for n, c in reversed(sorted(cs, key=lambda (_, c): c)):
+            print '%s:' % n, c
+            if i > 10:
+                return
+            i += 1
 
 
     def visit_all_blocks(self):
@@ -132,14 +179,14 @@ class PHPHeapDiag(gdb.Command):
     def visit_segment(self, seg):
         p = blockptr(charptr(seg) + zend_mm_aligned_segment_size)
         while 1:
+            self.visit_block(p)
+
             q = zend_mm_next_block(p)
 
             # simple integrity check - see zend_check_heap for more 
             # rigorous check.
             if q.dereference()['info']['_prev'] != blocksize(p):
                 print 'Heap corrupted - size field does not match previous'
-
-            self.visit_block(p)
 
             if zend_mm_is_guard_block(q):
                 return
@@ -155,6 +202,8 @@ class PHPHeapDiag(gdb.Command):
         if zend_mm_is_free_block(blockptr):
             self.free_block_count += 1
             self.free_space += size
+            if size > self.largest_free_block:
+                self.largest_free_block = size
             return
             
         self.used_block_count += 1
@@ -168,6 +217,34 @@ class PHPHeapDiag(gdb.Command):
         self.fragmentation_space += size - used_size - block_type.sizeof
 
         data = zend_mm_data_of(blockptr)
+        if used_size == zval_type.sizeof:
+            self.visit_zval(data.cast(zvalptr_type).dereference())
+
+        # todo other things?
+
+
+    def visit_zval(self, zval):
+        datatype = datatypes.get(int(zval['type']), 'unknown')
+        self.zval_counts[datatype] = self.zval_counts.get(datatype, 0) + 1
+
+        if datatype == 'object':
+            self.visit_object_value(zval['value']['obj'])
+
+        # todo other types
+
+
+    def get_objectptr(self, zobj):
+        handle = int(zobj['handle'])
+        buckets = self.eg['objects_store']['object_buckets']
+        bucket = (buckets + handle).dereference()['bucket']
+        return objptr(bucket['obj']['object'])
+
+
+    def visit_object_value(self, zobj):
+        zend_object_ptr = self.get_objectptr(zobj)
+        ce = zend_object_ptr.dereference()['ce']
+        name = ce['name'].string()
+        self.class_counts[name] = self.class_counts.get(name, 0) + 1
 
 
     def human_size_bytes(self, val):
@@ -184,5 +261,5 @@ class PHPHeapDiag(gdb.Command):
         print
         
 
-
-PHPHeapDiag().invoke('', '')
+diag = PHPHeapDiag()
+diag.invoke('', '')
