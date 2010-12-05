@@ -16,38 +16,37 @@ datatypes = {
     }
 
 
+block_type = gdb.lookup_type('zend_mm_block')
+blockptr_type = block_type.pointer()
+def blockptr(x): return x.cast(blockptr_type)
+
+voidptr_type = gdb.lookup_type('void').pointer()
+def voidptr(x): return x.cast(voidptr_type)
+
+charptr_type = gdb.lookup_type('char').pointer()
+def charptr(x): return x.cast(charptr_type)
+
+object_type = gdb.lookup_type('zend_object')
+objectptr_type = object_type.pointer()
+def objptr(x): return x.cast(objectptr_type)
+
+zval_type = gdb.lookup_type('zval')
+zvalptr_type = zval_type.pointer()
+def zvalptr(x): return x.cast(zvalptr_type)
+
+hashtable_type = gdb.lookup_type('HashTable')
+hashtableptr_type = hashtable_type.pointer()
+def hashtableptr(x): return x.cast(hashtableptr_type)
+
+bucket_type = gdb.lookup_type('Bucket')
+bucketptr_type = bucket_type.pointer()
+def bucketptr(x): return x.cast(bucketptr_type)
+
+
 zend_mm_alignment = 8
 zend_mm_alignment_mask = ~(zend_mm_alignment - 1)
 
 zend_mm_type_mask = 0x03L
-
-block_type = gdb.lookup_type('zend_mm_block')
-voidptr_type = gdb.lookup_type('void').pointer()
-charptr_type = gdb.lookup_type('char').pointer()
-blockptr_type = block_type.pointer()
-
-object_type = gdb.lookup_type('zend_object')
-objectptr_type = object_type.pointer()
-
-zval_type = gdb.lookup_type('zval')
-zvalptr_type = zval_type.pointer()
-
-
-
-def blockptr(x):
-    return x.cast(blockptr_type)
-
-
-def charptr(x):
-    return x.cast(charptr_type)
-
-
-def voidptr(x):
-    return x.cast(voidptr_type)
-
-
-def objptr(x):
-    return x.cast(objectptr_type)
 
 
 def zend_mm_aligned_size(size):
@@ -115,6 +114,7 @@ class PHPHeapDiag(gdb.Command):
         self.fragmentation_space = 0
         self.largest_free_block = 0
         self.zval_counts = {}
+        self.zval_sizes = {}
         self.class_counts = {}
 
 
@@ -143,21 +143,32 @@ class PHPHeapDiag(gdb.Command):
         print 'Fragmentation loss:', self.human_size_bytes(
             self.fragmentation_space)
         print
-        print 'Instance counts:'
-        self.print_counts(self.class_counts)
+        self.print_counts('instances', self.class_counts)
         print
-        print 'zval types:'
-        self.print_counts(self.zval_counts)
+        self.print_counts('zval types', self.zval_counts, self.zval_sizes)
 
 
-    def print_counts(self, d):
-        cs = [(n, c) for n, c in d.items()]
-        i = 0
+    def print_counts(self, label, counts, sizes = None):
+        if not sizes:
+            sizes = {}
+
+        fmt = '%-40s%-10s  %-10s'
+        print fmt % (label, 'count', 'size')
+        print fmt % (len(label)*'-', '-----', '----')
+
+        cs = [(n, c) for n, c in counts.items()]
+
+        csum, ssum = 0, 0
         for n, c in reversed(sorted(cs, key=lambda (_, c): c)):
-            print '%s:' % n, c
-            if i > 10:
-                return
-            i += 1
+            size = sizes.get(n, -1)
+            csum += c
+            ssum += max(size, 0)
+            size = self.human_size_bytes(size) if size > 0 else ''
+
+            print fmt % (n, c, size)
+            
+        print fmt % ('', '-'*10, '-'*10)
+        print fmt % ('Total:', csum, self.human_size_bytes(ssum))
 
 
     def visit_all_blocks(self):
@@ -227,10 +238,26 @@ class PHPHeapDiag(gdb.Command):
         datatype = datatypes.get(int(zval['type']), 'unknown')
         self.zval_counts[datatype] = self.zval_counts.get(datatype, 0) + 1
 
+        zs = zval_type.sizeof
         if datatype == 'object':
             self.visit_object_value(zval['value']['obj'])
+            size = 0 # todo
+        elif datatype == 'string':
+            size = int(zval['value']['str']['len']) + zs
+        elif datatype in ('array', 'constant_array'):
+            size = self.hashtable_size(zval['value']['ht'].dereference()) + zs
+        else:
+            size = zs
+
+        self.zval_sizes[datatype] = self.zval_sizes.get(datatype, 0) + size
 
         # todo other types
+
+
+    def hashtable_size(self, ht):
+        # the type contained within the hash table can be inferred from the 
+        # destructor function pointer
+        pass
 
 
     def get_objectptr(self, zobj):
@@ -248,7 +275,7 @@ class PHPHeapDiag(gdb.Command):
 
 
     def human_size_bytes(self, val):
-        for x in ['bytes','KB','MB','GB',]:
+        for x in [' bytes','KB','MB','GB',]:
             if val < 1024.0:
                 return "%3.1f%s" % (val, x)
             val /= 1024.0
