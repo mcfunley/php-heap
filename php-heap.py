@@ -6,8 +6,10 @@ zend_mm_alignment_mask = ~(zend_mm_alignment - 1)
 
 zend_mm_type_mask = 0x03L
 
+block_type = gdb.lookup_type('zend_mm_block')
+voidptr_type = gdb.lookup_type('void').pointer()
 charptr_type = gdb.lookup_type('char').pointer()
-blockptr_type = gdb.lookup_type('zend_mm_block').pointer()
+blockptr_type = block_type.pointer()
 
 
 def blockptr(x):
@@ -16,6 +18,10 @@ def blockptr(x):
 
 def charptr(x):
     return x.cast(charptr_type)
+
+
+def voidptr(x):
+    return x.cast(voidptr_type)
 
 
 def zend_mm_aligned_size(size):
@@ -27,6 +33,11 @@ def aligned_struct_size(name):
 
 
 zend_mm_aligned_segment_size = aligned_struct_size('zend_mm_segment')
+zend_mm_aligned_header_size = aligned_struct_size('zend_mm_block')
+
+
+def zend_mm_data_of(blockptr):
+    return voidptr(charptr(blockptr) + zend_mm_aligned_header_size)
 
 
 def zend_mm_block_size(blockptr):
@@ -76,6 +87,7 @@ class PHPHeapDiag(gdb.Command):
         self.free_space = 0
         self.used_block_count = 0
         self.used_space = 0
+        self.fragmentation_space = 0
 
 
     def invoke(self, arg, from_tty):
@@ -97,6 +109,8 @@ class PHPHeapDiag(gdb.Command):
         print 'Free space:', self.human_size_bytes(self.free_space)
         print 'Used blocks:', self.used_block_count
         print 'Used space:', self.human_size_bytes(self.used_space)
+        print 'Fragmentation loss:', self.human_size_bytes(
+            self.fragmentation_space)
 
 
     def visit_all_blocks(self):
@@ -145,6 +159,15 @@ class PHPHeapDiag(gdb.Command):
             
         self.used_block_count += 1
         self.used_space += size
+
+        # There will be fragmentation loss at the end of the block if the
+        # free block was larger than what was requested, but too small to 
+        # accomodate an additional header and minimum amount of data. 
+        block = blockptr.dereference()
+        used_size = block['debug']['size']
+        self.fragmentation_space += size - used_size - block_type.sizeof
+
+        data = zend_mm_data_of(blockptr)
 
 
     def human_size_bytes(self, val):
