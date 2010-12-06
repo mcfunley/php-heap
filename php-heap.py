@@ -62,7 +62,8 @@ def blockptr(x): return x.cast(blockptr_type)
 voidptr_type = gdb.lookup_type('void').pointer()
 def voidptr(x): return x.cast(voidptr_type)
 
-charptr_type = gdb.lookup_type('char').pointer()
+char_type = gdb.lookup_type('char')
+charptr_type = char_type.pointer()
 def charptr(x): return x.cast(charptr_type)
 
 object_type = gdb.lookup_type('zend_object')
@@ -175,6 +176,10 @@ class PHPHeapDiag(gdb.Command):
         self.zval_counts = {}
         self.zval_sizes = {}
         self.class_counts = {}
+        self.class_sizes = {}
+
+        # Map of addresses that have already been crawled for size. 
+        self.sized = {}
 
 
     def invoke(self, arg, from_tty):
@@ -197,6 +202,7 @@ class PHPHeapDiag(gdb.Command):
         """
         Prints the heap statistics collected during the run. 
         """
+        block_overhead = self.block_count * block_type.sizeof
         print 'Real size:', self.human_size_bytes(self.heap['real_size'])
         print 'Peak size:', self.human_size_bytes(self.heap['real_peak'])
         print 'Memory limit:', self.human_size_bytes(self.heap['limit'])
@@ -206,12 +212,13 @@ class PHPHeapDiag(gdb.Command):
         print 'Free space:', self.human_size_bytes(self.free_space)
         print 'Largest free block:', self.human_size_bytes(
             self.largest_free_block)
+        print 'Block header overhead:', self.human_size_bytes(block_overhead)
         print 'Used blocks:', self.used_block_count
         print 'Used space:', self.human_size_bytes(self.used_space)
         print 'Fragmentation loss:', self.human_size_bytes(
             self.fragmentation_space)
         print
-        self.print_counts('instances', self.class_counts)
+        self.print_counts('instances', self.class_counts, self.class_sizes)
         print
         self.print_counts('zval types', self.zval_counts, self.zval_sizes)
 
@@ -342,37 +349,107 @@ class PHPHeapDiag(gdb.Command):
         return used_size
 
 
+    def have_sized(self, address):
+        address = long(address)
+        if address in self.sized:
+            return True
+        self.sized[address] = 1
+        return False
+
+
     def visit_zval(self, zval):
         """
-        Aggregates statistics given a single zval. 
+        Aggregates statistics given a single zval. Returns the total size of 
+        the zval.
         """
+        if self.have_sized(zval.address):
+            return 0
+
         datatype = datatypes.get(int(zval['type']), 'unknown')
         self.zval_counts[datatype] = self.zval_counts.get(datatype, 0) + 1
 
         zs = zval_type.sizeof
         if datatype == 'object':
-            self.visit_object_value(zval['value']['obj'])
-            size = 0 # todo
+            size = self.visit_object_value(zval['value']['obj']) + zs
         elif datatype == 'string':
             size = int(zval['value']['str']['len']) + zs
         elif datatype in ('array', 'constant_array'):
-            size = self.hashtable_size(zval['value']['ht'].dereference()) + zs
+            size = self.visit_hashtable(zval['value']['ht'].dereference()) + zs
         else:
             # the value types are stored within the zval. 
             size = zs
 
         self.zval_sizes[datatype] = self.zval_sizes.get(datatype, 0) + size
+        return size
 
 
-    def hashtable_size(self, ht):
+    def visit_hashtable(self, ht):
+        """
+        Walks a hash table, recording relevant statistics. Returns the size of
+        the hash table and its contained objects. 
+        """
         # the type contained within the hash table can be inferred from the 
         # destructor function pointer
+        if self.have_sized(ht.address):
+            return 0
+
         dtor = ht['pDestructor']
         if 'zval_ptr_dtor' in str(dtor):
-            pass
+            return self.visit_zval_ptr_hash(ht)
         else:
-            print 'unknown array', dtor
+            print 'unknown array, dtor:', dtor
         return -1000
+
+
+    def visit_zval_ptr_hash(self, ht):
+        # php arrays are implemented as chained hash tables: 
+        #
+        #  - The hash function (zend_inline_hash_func) maps a key to an index 
+        #    in the arBuckets array. 
+        #  - If multiple keys map to the same index, the buckets are chained
+        #    using their pNext pointers. 
+        #
+        # Resizing, etc works like you would expect. 
+        #
+        # Furthermore, the buckets across the entire hash also form a linked 
+        # list, from which spawns the php array hash/list duality (o_O). 
+
+        # Notes about buckets:
+        #  - The string key immediately follows the bucket in memory. 
+
+        # The meaning of pData and pDataPtr appears to vary depending on what
+        # is being stored in the bucket. The possibilities appear to be:
+        #  - zval*
+        #  - zend_module_entry
+        #  - zend_function
+        #  - null-termed file paths, other strings
+        #  - zend_class_entry* 
+        # 
+        # TBD somewhat, but it seems as though for our purposes we can ignore 
+        # all of these except for zval pointers since they pertain to codegen
+        # and don't use the mm_heap. 
+        
+        s = hashtable_type.sizeof
+
+        # account for the array of bucket chains
+        nTableSize = int(ht['nTableSize'])
+        bpsize = bucketptr_type.sizeof
+        s += nTableSize * bpsize
+
+        bp = ht['pListHead']
+        while bp != 0:
+            b = bp.dereference()
+
+            # The key is stored immediately after the bucket; we have to account
+            # for the sentinel char at the end of the struct. 
+            s += bucket_type.sizeof - char_type.sizeof + b['nKeyLength']
+
+            zval = zvalptr(b['pDataPtr']).dereference()
+            s += self.visit_zval(zval)
+
+            bp = b['pListNext']
+        
+        return long(s)
 
 
     def get_objectptr(self, zobj):
@@ -395,12 +472,30 @@ class PHPHeapDiag(gdb.Command):
         ce = zend_object_ptr.dereference()['ce']
         name = ce['name'].string()
         self.class_counts[name] = self.class_counts.get(name, 0) + 1
+        
+        # the size of zobj is accounted for in the enclosing zvalue_value.
+        s = self.size_zend_object_ptr(zend_object_ptr)
+        self.class_sizes[name] = self.class_sizes.get(name, 0) + s
+        return s
+
+
+    def size_zend_object_ptr(self, zend_object_ptr):
+        zobj = zend_object_ptr.dereference()
+        props = zobj['properties'].dereference()
+        s = object_type.sizeof 
+
+        if zobj['properties']:
+            s += self.visit_hashtable(zobj['properties'].dereference())
+        if zobj['guards']:
+            s += self.visit_hashtable(zobj['guards'].dereference())
+            
+        return s
 
 
     def human_size_bytes(self, val):
         for x in [' bytes','KB','MB','GB',]:
             if val < 1024.0:
-                return "%3.1f%s" % (val, x)
+                return "%3.1f%s" % (float(val), x)
             val /= 1024.0
                     
 
