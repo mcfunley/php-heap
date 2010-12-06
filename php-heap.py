@@ -1,6 +1,41 @@
+"""
+  php-heap - gdb extensions for debugging and analyzing the PHP heap.
+  Copyright (C) 2010 Dan McKinley
+
+  -----  
+  Usage:
+
+  How this works:
+
+  -----
+
+  Basics about PHP memory:
+
+  Basics about PHP types:
+
+  Some important places to refer to in the PHP sources:
+  
+  -----
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+  
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+  
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""
 import gdb
 import sys
 
+
+### The zval datatypes. 
 
 datatypes = {
     0: 'null',
@@ -16,6 +51,10 @@ datatypes = {
     }
 
 
+### Definitions for types, their corresponding pointer types, and shortcuts
+### for casts.
+
+# These are the most fundamental unit of the heap. 
 block_type = gdb.lookup_type('zend_mm_block')
 blockptr_type = block_type.pointer()
 def blockptr(x): return x.cast(blockptr_type)
@@ -34,14 +73,19 @@ zval_type = gdb.lookup_type('zval')
 zvalptr_type = zval_type.pointer()
 def zvalptr(x): return x.cast(zvalptr_type)
 
+# aka arrays.
 hashtable_type = gdb.lookup_type('HashTable')
 hashtableptr_type = hashtable_type.pointer()
 def hashtableptr(x): return x.cast(hashtableptr_type)
 
+# Storage unit for hash tables. 
 bucket_type = gdb.lookup_type('Bucket')
 bucketptr_type = bucket_type.pointer()
 def bucketptr(x): return x.cast(bucketptr_type)
 
+
+### This is a recreation of the alignment calculations in zend_alloc.c. 
+### These constants and functions are used to compute block locations. 
 
 zend_mm_alignment = 8
 zend_mm_alignment_mask = ~(zend_mm_alignment - 1)
@@ -61,6 +105,8 @@ zend_mm_aligned_segment_size = aligned_struct_size('zend_mm_segment')
 zend_mm_aligned_header_size = aligned_struct_size('zend_mm_block')
 
 
+### Methods for navigating blocks on the heap and retrieving their data.
+
 def zend_mm_data_of(blockptr):
     return voidptr(charptr(blockptr) + zend_mm_aligned_header_size)
 
@@ -78,6 +124,7 @@ def zend_mm_block_at(block, offset):
     return blockptr(charptr(block) + offset)
 
 
+# Constants used to track the status of a particular block. 
 zend_mm_free_block = 0x00L
 zend_mm_used_block = 0x01L
 zend_mm_guard_block = 0x03L
@@ -101,11 +148,23 @@ def zend_mm_is_guard_block(blockptr):
 
 
 class PHPHeapDiag(gdb.Command):
+    """
+    Command that scans the entire heap and performs an analysis of usage. 
+    
+    Call with no arguments. 
+      
+      (gdb) php-heap-diag
+    
+    """
     def __init__(self):
         gdb.Command.__init__(self, 'php-heap-diag', gdb.COMMAND_DATA) 
 
 
     def reset_stats(self):
+        """
+        Resets the statistics stored as instance fields. Called before 
+        an invocation of the command. 
+        """
         self.block_count = 0
         self.free_block_count = 0
         self.free_space = 0
@@ -119,6 +178,9 @@ class PHPHeapDiag(gdb.Command):
 
 
     def invoke(self, arg, from_tty):
+        """
+        Runs the command.
+        """
         self.reset_stats()
 
         self.frame = gdb.selected_frame()
@@ -128,11 +190,17 @@ class PHPHeapDiag(gdb.Command):
 
         self.visit_all_blocks()
 
-        self.print_overall_stats()
-        self.print_block_stats()
+        self.print_stats()
 
 
-    def print_block_stats(self):
+    def print_stats(self):
+        """
+        Prints the heap statistics collected during the run. 
+        """
+        print 'Real size:', self.human_size_bytes(self.heap['real_size'])
+        print 'Peak size:', self.human_size_bytes(self.heap['real_peak'])
+        print 'Memory limit:', self.human_size_bytes(self.heap['limit'])
+        print
         print 'Block count:', self.block_count
         print 'Free blocks:', self.free_block_count
         print 'Free space:', self.human_size_bytes(self.free_space)
@@ -149,6 +217,11 @@ class PHPHeapDiag(gdb.Command):
 
 
     def print_counts(self, label, counts, sizes = None):
+        """
+        Prints out a table given dictionaries of counts and total sizes. 
+        The keys in the two dictionaries should match. The sizes are optional.
+        The label parameter indicates what the keys represents. 
+        """
         if not sizes:
             sizes = {}
 
@@ -172,12 +245,19 @@ class PHPHeapDiag(gdb.Command):
 
 
     def visit_all_blocks(self):
+        """
+        Walks the entire heap, collecting stats. 
+        """
         self.log('Analyzing heap ')
+
+        # The heap is implemented as a linked list of segments, each 
+        # containing a contiguous list of blocks. 
         seg = self.heap['segments_list']
         while seg:
             self.visit_segment(seg)
             seg = seg['next_segment']
             self.log('.')
+
         print ' done.'
         print
 
@@ -188,6 +268,9 @@ class PHPHeapDiag(gdb.Command):
 
 
     def visit_segment(self, seg):
+        """
+        Walks each block in the given segment, collecting stats. 
+        """
         p = blockptr(charptr(seg) + zend_mm_aligned_segment_size)
         while 1:
             self.visit_block(p)
@@ -199,6 +282,7 @@ class PHPHeapDiag(gdb.Command):
             if q.dereference()['info']['_prev'] != blocksize(p):
                 print 'Heap corrupted - size field does not match previous'
 
+            # the segment is terminated by a special guard block. 
             if zend_mm_is_guard_block(q):
                 return
 
@@ -206,8 +290,37 @@ class PHPHeapDiag(gdb.Command):
 
 
     def visit_block(self, blockptr):
+        """
+        Aggregates statistics given a single block. 
+        """
         self.block_count += 1
-        
+
+        used_size = self.count_block_size(blockptr)
+
+        if used_size < 0:
+            # free block
+            return 
+
+        # Based on the size of the used portion of the block, make a guess
+        # about what it contains (generally you can guess that it's a zval
+        # this way with a high degree of accuracy). 
+
+        data = zend_mm_data_of(blockptr)
+        if used_size == zval_type.sizeof:
+            self.visit_zval(data.cast(zvalptr_type).dereference())
+
+        # todo other things?
+
+
+    def count_block_size(self, blockptr):
+        """
+        Given a block, tracks its free or used space. If the block is in use,
+        this also tracks the amount of fragmentation in the unused portion of
+        the block. Also keeps track of some aggregated statistics. 
+
+        Returns the count of bytes in the block that are in use (not counting 
+        the block header). 
+        """
         size = blocksize(blockptr)
 
         if zend_mm_is_free_block(blockptr):
@@ -215,7 +328,7 @@ class PHPHeapDiag(gdb.Command):
             self.free_space += size
             if size > self.largest_free_block:
                 self.largest_free_block = size
-            return
+            return -1
             
         self.used_block_count += 1
         self.used_space += size
@@ -226,15 +339,13 @@ class PHPHeapDiag(gdb.Command):
         block = blockptr.dereference()
         used_size = block['debug']['size']
         self.fragmentation_space += size - used_size - block_type.sizeof
-
-        data = zend_mm_data_of(blockptr)
-        if used_size == zval_type.sizeof:
-            self.visit_zval(data.cast(zvalptr_type).dereference())
-
-        # todo other things?
+        return used_size
 
 
     def visit_zval(self, zval):
+        """
+        Aggregates statistics given a single zval. 
+        """
         datatype = datatypes.get(int(zval['type']), 'unknown')
         self.zval_counts[datatype] = self.zval_counts.get(datatype, 0) + 1
 
@@ -247,20 +358,30 @@ class PHPHeapDiag(gdb.Command):
         elif datatype in ('array', 'constant_array'):
             size = self.hashtable_size(zval['value']['ht'].dereference()) + zs
         else:
+            # the value types are stored within the zval. 
             size = zs
 
         self.zval_sizes[datatype] = self.zval_sizes.get(datatype, 0) + size
-
-        # todo other types
 
 
     def hashtable_size(self, ht):
         # the type contained within the hash table can be inferred from the 
         # destructor function pointer
-        pass
+        dtor = ht['pDestructor']
+        if 'zval_ptr_dtor' in str(dtor):
+            pass
+        else:
+            print 'unknown array', dtor
+        return -1000
 
 
     def get_objectptr(self, zobj):
+        """
+        Gets a zend_object* given a zend_object_value structure. (The struct 
+        contains an object handle that has to be mapped to the real address.)
+        """
+        # The handle is used as a simple offset in a global object table, kept
+        # in the executor_globals. The entry in the table has the pointer.
         handle = int(zobj['handle'])
         buckets = self.eg['objects_store']['object_buckets']
         bucket = (buckets + handle).dereference()['bucket']
@@ -268,6 +389,8 @@ class PHPHeapDiag(gdb.Command):
 
 
     def visit_object_value(self, zobj):
+        """
+        """
         zend_object_ptr = self.get_objectptr(zobj)
         ce = zend_object_ptr.dereference()['ce']
         name = ce['name'].string()
@@ -279,14 +402,7 @@ class PHPHeapDiag(gdb.Command):
             if val < 1024.0:
                 return "%3.1f%s" % (val, x)
             val /= 1024.0
-            
-
-    def print_overall_stats(self):
-        print 'Real size:', self.human_size_bytes(self.heap['real_size'])
-        print 'Peak size:', self.human_size_bytes(self.heap['real_peak'])
-        print 'Memory limit:', self.human_size_bytes(self.heap['limit'])
-        print
-        
+                    
 
 diag = PHPHeapDiag()
 diag.invoke('', '')
