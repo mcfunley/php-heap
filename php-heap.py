@@ -499,5 +499,3 @@ class PHPHeapDiag(gdb.Command):
             val /= 1024.0
                     
 
-diag = PHPHeapDiag()
-diag.invoke('', '')
