@@ -3,17 +3,56 @@
   Copyright (C) 2010 Dan McKinley
 
   -----  
-  Usage:
-
-  How this works:
-
+  
+  For usage, setup, etc, please see the README. 
+}  
   -----
 
   Basics about PHP memory:
 
+    PHP maintains a heap for scripts, implemented as a linked list of segments,
+    divided into blocks given to individual allocations. There is a free list
+    as well as some other optimizations around finding free blocks, mostly not
+    pertinent to this tool. 
+
+    Segments are allocated as needed, up to the configured memory limit. 
+
+    This tool walks through each segment, counting up the memory for each block 
+    that is in use. 
+
   Basics about PHP types:
 
+    The fundamental PHP type is the zvalue. This is a variant type that holds 
+    either a primitive type or a reference to another type somewhere else on 
+    the heap. 
+    
+    The only extended values allowed are arrays (called HashTables in the PHP
+    source) and objects. From the point of view of the allocator, objects are 
+    just hash tables of properties and a pointer to a class. (The class does
+    not count against a script's memory footprint, but of course the properties 
+    do). 
+
+    Objects within zvals have an extra level of indirection. The zval has an 
+    object handle, which indexes the objects_store in the executor_globals. 
+    The objects_store entry then points at the real value of the object. 
+
   Some important places to refer to in the PHP sources:
+
+    * zend_alloc.c / zend_alloc.h 
+        Allocator, definitions of segments and blocks, and important constants
+        and #defines for walking around the heap.
+
+    * zend.h
+        Definitions of zvals and class entries. 
+
+    * zend_types.h
+        Has zend_object_value, embedded inside of zvals for objects. 
+
+    * zend_objects_API.h
+        Definition of the objects_store and its buckets. 
+
+    * zend_hash.c / zend_hash.h
+        Hashtables, aka PHP arrays. 
   
   -----
 
@@ -551,9 +590,10 @@ class PHPHeapDiag(gdb.Command):
 
 
     def visit_object_value(self, zobj):
-        """
-        """
         zend_object_ptr = self.get_objectptr(zobj)
+        if self.have_sized(zend_object_ptr):
+            return 0
+
         ce = zend_object_ptr.dereference()['ce']
         name = ce['name'].string()
         self.class_counts[name] = self.class_counts.get(name, 0) + 1
