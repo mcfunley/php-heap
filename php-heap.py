@@ -211,7 +211,6 @@ class PHPHeapDiag(gdb.Command):
         self.free_space = 0
         self.used_block_count = 0
         self.used_space = 0
-        self.fragmentation_space = 0
         self.largest_free_block = 0
         self.zval_counts = {}
         self.zval_sizes = {}
@@ -255,8 +254,6 @@ class PHPHeapDiag(gdb.Command):
         print 'Block header overhead:', self.human_size_bytes(block_overhead)
         print 'Used blocks:', self.used_block_count
         print 'Used space:', self.human_size_bytes(self.used_space)
-        print 'Fragmentation loss:', self.human_size_bytes(
-            self.fragmentation_space)
         print
         print 'Object store buckets:', self.eg['objects_store']['size']
         print
