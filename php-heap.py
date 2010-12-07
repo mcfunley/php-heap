@@ -33,6 +33,7 @@
 """
 import gdb
 import sys
+    
 
 
 ### The zval datatypes. 
@@ -84,6 +85,28 @@ bucket_type = gdb.lookup_type('Bucket')
 bucketptr_type = bucket_type.pointer()
 def bucketptr(x): return x.cast(bucketptr_type)
 
+unsigned_int_type = gdb.lookup_type('unsigned int')
+
+zend_object_store_bucket_type = gdb.lookup_type('zend_object_store_bucket')
+zend_object_store_bucketptr_type = zend_object_store_bucket_type.pointer()
+def zend_object_store_bucketptr(x):
+    return x.cast(zend_object_store_bucketptr_type)
+
+
+
+### figure out if this is a debug mode build or not, and so on (affects the 
+### values of some constants).
+
+try:
+    _debug_info_type = gdb.lookup_type('zend_mm_debug_info')
+except RuntimeError:
+    zend_debug = 0
+    zend_mm_heap_protection = 0
+else:
+    _fields = [x.name for x in _debug_info_type.strip_typedefs().fields()]
+    zend_mm_heap_protection = 'start_magic' in _fields
+    zend_debug = 'filename' in _fields
+
 
 ### This is a recreation of the alignment calculations in zend_alloc.c. 
 ### These constants and functions are used to compute block locations. 
@@ -104,6 +127,23 @@ def aligned_struct_size(name):
 
 zend_mm_aligned_segment_size = aligned_struct_size('zend_mm_segment')
 zend_mm_aligned_header_size = aligned_struct_size('zend_mm_block')
+
+end_magic_size = unsigned_int_type.sizeof if zend_mm_heap_protection else 0
+
+zend_mm_min_alloc_block_size = zend_mm_aligned_size(
+    zend_mm_aligned_header_size + end_magic_size)
+
+try:
+    zend_mm_aligned_free_header_size = \
+        aligned_struct_size('zend_mm_small_free_block')
+except RuntimeError:
+    # the compiler seems to optimize the _small variant out
+    zend_mm_aligned_free_header_size = \
+        aligned_struct_size('zend_mm_free_block')
+
+zend_mm_aligned_min_header_size = max(
+    zend_mm_aligned_free_header_size,
+    zend_mm_min_alloc_block_size)
 
 
 ### Methods for navigating blocks on the heap and retrieving their data.
@@ -218,6 +258,8 @@ class PHPHeapDiag(gdb.Command):
         print 'Fragmentation loss:', self.human_size_bytes(
             self.fragmentation_space)
         print
+        print 'Object store buckets:', self.eg['objects_store']['size']
+        print
         self.print_counts('instances', self.class_counts, self.class_sizes)
         print
         self.print_counts('zval types', self.zval_counts, self.zval_sizes)
@@ -302,31 +344,70 @@ class PHPHeapDiag(gdb.Command):
         """
         self.block_count += 1
 
-        used_size = self.count_block_size(blockptr)
-
-        if used_size < 0:
+        size = self.count_block_size(blockptr)
+        if size < 0:
             # free block
             return 
 
-        # Based on the size of the used portion of the block, make a guess
-        # about what it contains (generally you can guess that it's a zval
-        # this way with a high degree of accuracy). 
-
         data = zend_mm_data_of(blockptr)
-        if used_size == zval_type.sizeof:
-            self.visit_zval(data.cast(zvalptr_type).dereference())
+        if self.looks_like_zval(size, data):
+            self.visit_zval(zvalptr(data).dereference())
 
-        # todo other things?
+
+    def looks_like_zval(self, size, data):
+        """
+        Epic kluge to guess if a data block is a zval. 
+        """
+        zval_size = zval_type.sizeof
+        if size < zval_size:
+            # the block is too small
+            return False
+
+        if size > zval_size + zend_mm_aligned_min_header_size:
+            # The allocator would  have used the remainder of this 
+            # space for another block. 
+            return False
+
+        # commence sniffing around inside the structure, getting 
+        # increasingly more ridiculous
+
+        zval = zvalptr(data).dereference()
+        t = int(zval['type'])
+        if t not in datatypes:
+            return False
+
+        if int(zval['is_ref']) not in (0, 1):
+            return False
+        if zval['refcount'] > 75 or zval['refcount'] < 0:
+            return False
+
+        if datatypes[t] in ('array', 'constant_array'):
+            # check to see if there's a symbol for the destructor. 
+            ht = zval['value']['ht'].dereference()
+            dtor = ht['pDestructor']
+            try:
+                # kind of a shitty way to tell if pDestructor points at a symbol
+                # and that symbol sounds like it's a destructor
+                if 'dtor' not in str(dtor):
+                    return False
+            except:
+                return False
+        elif datatypes[t] == 'object':
+            # make sure the target object of the zval is defined
+            zobj = zval['value']['obj']
+            if not self.get_objectptr(zobj):
+                return False
+
+        # shrug
+        return True
 
 
     def count_block_size(self, blockptr):
         """
-        Given a block, tracks its free or used space. If the block is in use,
-        this also tracks the amount of fragmentation in the unused portion of
-        the block. Also keeps track of some aggregated statistics. 
+        Given a block, tracks its free or used space. Also keeps track of 
+        some aggregated statistics. 
 
-        Returns the count of bytes in the block that are in use (not counting 
-        the block header). 
+        Returns the count of bytes in the block, not counting the block header.
         """
         size = blocksize(blockptr)
 
@@ -339,14 +420,7 @@ class PHPHeapDiag(gdb.Command):
             
         self.used_block_count += 1
         self.used_space += size
-
-        # There will be fragmentation loss at the end of the block if the
-        # free block was larger than what was requested, but too small to 
-        # accomodate an additional header and minimum amount of data. 
-        block = blockptr.dereference()
-        used_size = block['debug']['size']
-        self.fragmentation_space += size - used_size - block_type.sizeof
-        return used_size
+        return size
 
 
     def have_sized(self, address):
@@ -372,7 +446,15 @@ class PHPHeapDiag(gdb.Command):
         if datatype == 'object':
             size = self.visit_object_value(zval['value']['obj']) + zs
         elif datatype == 'string':
-            size = int(zval['value']['str']['len']) + zs
+            string = zval['value']['str']
+            strlen = int(zval['value']['str']['len'])
+            try:
+                if 'out of bounds' in str(string['val']):
+                    size = zs
+                else:
+                    size = strlen + zs
+            except:
+                size = zs
         elif datatype in ('array', 'constant_array'):
             size = self.visit_hashtable(zval['value']['ht'].dereference()) + zs
         else:
@@ -460,7 +542,13 @@ class PHPHeapDiag(gdb.Command):
         # The handle is used as a simple offset in a global object table, kept
         # in the executor_globals. The entry in the table has the pointer.
         handle = int(zobj['handle'])
-        buckets = self.eg['objects_store']['object_buckets']
+        store = self.eg['objects_store']
+
+        h = long(handle)
+        if h < 0 or h > long(store['size']):
+            return None
+
+        buckets = store['object_buckets']
         bucket = (buckets + handle).dereference()['bucket']
         return objptr(bucket['obj']['object'])
 
@@ -498,4 +586,5 @@ class PHPHeapDiag(gdb.Command):
                 return "%3.1f%s" % (float(val), x)
             val /= 1024.0
                     
-
+x = PHPHeapDiag()
+x.invoke('','')
