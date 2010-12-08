@@ -227,7 +227,7 @@ def zend_mm_is_guard_block(blockptr):
 
 
 
-def human_size_bytes(self, val):
+def human_size_bytes(val):
     """
     Returns a human-legible string for the given byte count. 
     """
