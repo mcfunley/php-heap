@@ -5,7 +5,7 @@
   -----  
   
   For usage, setup, etc, please see the README. 
-}  
+
   -----
 
   Basics about PHP memory:
@@ -227,6 +227,88 @@ def zend_mm_is_guard_block(blockptr):
 
 
 
+def human_size_bytes(self, val):
+    """
+    Returns a human-legible string for the given byte count. 
+    """
+    for x in [' bytes','KB','MB','GB',]:
+        if val < 1024.0:
+            return "%3.1f%s" % (float(val), x)
+        val /= 1024.0
+
+
+
+class Accumulator(object):
+    def __init__(self):
+        self.visited = {}
+        self.object_counts = {}
+        self.object_sizes = {}
+        self.objects = []
+        self.zval_counts = {}
+        self.zval_sizes = {}
+
+
+    def have_visited(self, address):
+        address = long(address)
+        if address in self.visited:
+            return True
+        self.visited[address] = 1
+        return False
+
+
+    def incr(self, d, k, n = 1):
+        d[k] = d.get(k, 0) + n
+
+
+    def visited_object(self, ptr, classname, size):
+        self.incr(self.object_counts, classname)
+        self.incr(self.object_sizes, classname, size)
+        self.objects.append(ptr)
+
+
+    def visited_zval(self, ptr, typename, size):
+        self.incr(self.zval_counts, typename)
+        self.incr(self.zval_sizes, typename, size)
+
+
+    def print_zval_table(self):
+        self.print_counts('zval types', self.zval_counts, self.zval_sizes)
+
+
+    def print_object_table(self):
+        self.print_counts('instances', self.object_counts, self.object_sizes)
+
+
+    def print_counts(self, label, counts, sizes = None):
+        """
+        Prints out a table given dictionaries of counts and total sizes. 
+        The keys in the two dictionaries should match. The sizes are optional.
+        The label parameter indicates what the keys represents. 
+        """
+        if not sizes:
+            sizes = {}
+
+        fmt = '%-40s%-10s  %-10s'
+        print fmt % (label, 'count', 'size')
+        print fmt % (len(label)*'-', '-----', '----')
+
+        cs = [(n, c) for n, c in counts.items()]
+
+        csum, ssum = 0, 0
+        for n, c in reversed(sorted(cs, key=lambda (_, c): c)):
+            size = sizes.get(n, -1)
+            csum += c
+            ssum += max(size, 0)
+            size = human_size_bytes(size) if size > 0 else ''
+
+            print fmt % (n, c, size)
+            
+        print fmt % ('', '-'*10, '-'*10)
+        print fmt % ('Total:', csum, human_size_bytes(ssum))
+        print
+
+
+
 class PHPHeapDiag(gdb.Command):
     """
     Command that scans the entire heap and performs an analysis of usage. 
@@ -251,13 +333,9 @@ class PHPHeapDiag(gdb.Command):
         self.used_block_count = 0
         self.used_space = 0
         self.largest_free_block = 0
-        self.zval_counts = {}
-        self.zval_sizes = {}
-        self.class_counts = {}
-        self.class_sizes = {}
 
-        # Map of addresses that have already been crawled for size. 
-        self.sized = {}
+        self.accumulator = Accumulator()
+
 
 
     def invoke(self, arg, from_tty):
@@ -272,6 +350,7 @@ class PHPHeapDiag(gdb.Command):
         self.eg = self.frame.read_var('executor_globals')
 
         self.visit_all_blocks()
+        self.walk_objects(self.zval_results.objects)
 
         self.print_stats()
 
@@ -281,52 +360,31 @@ class PHPHeapDiag(gdb.Command):
         Prints the heap statistics collected during the run. 
         """
         block_overhead = self.block_count * block_type.sizeof
-        print 'Real size:', self.human_size_bytes(self.heap['real_size'])
-        print 'Peak size:', self.human_size_bytes(self.heap['real_peak'])
-        print 'Memory limit:', self.human_size_bytes(self.heap['limit'])
+        print 'Real size:', human_size_bytes(self.heap['real_size'])
+        print 'Peak size:', human_size_bytes(self.heap['real_peak'])
+        print 'Memory limit:', human_size_bytes(self.heap['limit'])
         print
         print 'Block count:', self.block_count
         print 'Free blocks:', self.free_block_count
-        print 'Free space:', self.human_size_bytes(self.free_space)
-        print 'Largest free block:', self.human_size_bytes(
-            self.largest_free_block)
-        print 'Block header overhead:', self.human_size_bytes(block_overhead)
+        print 'Free space:', human_size_bytes(self.free_space)
+        print 'Largest free block:', human_size_bytes(self.largest_free_block)
+        print 'Block header overhead:', human_size_bytes(block_overhead)
         print 'Used blocks:', self.used_block_count
-        print 'Used space:', self.human_size_bytes(self.used_space)
+        print 'Used space:', human_size_bytes(self.used_space)
         print
         print 'Object store buckets:', self.eg['objects_store']['size']
         print
-        self.print_counts('instances', self.class_counts, self.class_sizes)
-        print
-        self.print_counts('zval types', self.zval_counts, self.zval_sizes)
+        self.object_results.print_object_table()
+        self.zval_results.print_zval_table()
 
 
-    def print_counts(self, label, counts, sizes = None):
-        """
-        Prints out a table given dictionaries of counts and total sizes. 
-        The keys in the two dictionaries should match. The sizes are optional.
-        The label parameter indicates what the keys represents. 
-        """
-        if not sizes:
-            sizes = {}
+    def walk_objects(self, objects):
+        self.accumulator = Accumulator()
 
-        fmt = '%-40s%-10s  %-10s'
-        print fmt % (label, 'count', 'size')
-        print fmt % (len(label)*'-', '-----', '----')
+        for p in objects:
+            self.visit_object_ptr(p)
 
-        cs = [(n, c) for n, c in counts.items()]
-
-        csum, ssum = 0, 0
-        for n, c in reversed(sorted(cs, key=lambda (_, c): c)):
-            size = sizes.get(n, -1)
-            csum += c
-            ssum += max(size, 0)
-            size = self.human_size_bytes(size) if size > 0 else ''
-
-            print fmt % (n, c, size)
-            
-        print fmt % ('', '-'*10, '-'*10)
-        print fmt % ('Total:', csum, self.human_size_bytes(ssum))
+        self.object_results = self.accumulator
 
 
     def visit_all_blocks(self):
@@ -342,6 +400,8 @@ class PHPHeapDiag(gdb.Command):
             self.visit_segment(seg)
             seg = seg['next_segment']
             self.log('.')
+
+        self.zval_results = self.accumulator
 
         print ' done.'
         print
@@ -459,24 +519,15 @@ class PHPHeapDiag(gdb.Command):
         return size
 
 
-    def have_sized(self, address):
-        address = long(address)
-        if address in self.sized:
-            return True
-        self.sized[address] = 1
-        return False
-
-
     def visit_zval(self, zval):
         """
         Aggregates statistics given a single zval. Returns the total size of 
         the zval.
         """
-        if self.have_sized(zval.address):
+        if self.accumulator.have_visited(zval.address):
             return 0
 
         datatype = datatypes.get(int(zval['type']), 'unknown')
-        self.zval_counts[datatype] = self.zval_counts.get(datatype, 0) + 1
 
         zs = zval_type.sizeof
         if datatype == 'object':
@@ -497,7 +548,7 @@ class PHPHeapDiag(gdb.Command):
             # the value types are stored within the zval. 
             size = zs
 
-        self.zval_sizes[datatype] = self.zval_sizes.get(datatype, 0) + size
+        self.accumulator.visited_zval(zval.address, datatype, size)
         return size
 
 
@@ -508,7 +559,7 @@ class PHPHeapDiag(gdb.Command):
         """
         # the type contained within the hash table can be inferred from the 
         # destructor function pointer
-        if self.have_sized(ht.address):
+        if self.accumulator.have_visited(ht.address):
             return 0
 
         dtor = ht['pDestructor']
@@ -586,21 +637,26 @@ class PHPHeapDiag(gdb.Command):
 
         buckets = store['object_buckets']
         bucket = (buckets + handle).dereference()['bucket']
-        return objptr(bucket['obj']['object'])
+        p = objptr(bucket['obj']['object'])
+        return p
 
 
     def visit_object_value(self, zobj):
-        zend_object_ptr = self.get_objectptr(zobj)
-        if self.have_sized(zend_object_ptr):
+        # note that the size of zobj is accounted for in the enclosing 
+        # zvalue_value.
+        return self.visit_object_ptr(self.get_objectptr(zobj))
+
+
+    def visit_object_ptr(self, zend_object_ptr):
+        if self.accumulator.have_visited(zend_object_ptr):
             return 0
 
         ce = zend_object_ptr.dereference()['ce']
         name = ce['name'].string()
-        self.class_counts[name] = self.class_counts.get(name, 0) + 1
         
-        # the size of zobj is accounted for in the enclosing zvalue_value.
         s = self.size_zend_object_ptr(zend_object_ptr)
-        self.class_sizes[name] = self.class_sizes.get(name, 0) + s
+
+        self.accumulator.visited_object(zend_object_ptr, name, s)
         return s
 
 
@@ -616,12 +672,6 @@ class PHPHeapDiag(gdb.Command):
             
         return s
 
-
-    def human_size_bytes(self, val):
-        for x in [' bytes','KB','MB','GB',]:
-            if val < 1024.0:
-                return "%3.1f%s" % (float(val), x)
-            val /= 1024.0
                     
 x = PHPHeapDiag()
 x.invoke('','')
