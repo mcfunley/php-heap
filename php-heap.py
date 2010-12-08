@@ -314,6 +314,10 @@ class Crawler(object):
         self.accumulator = Accumulator()
         self.eg = gdb.selected_frame().read_var('executor_globals')
 
+
+    def found_objects(self):
+        return self.accumulator.objects
+
     
     def visit_voidptr(self, voidptr, size):
         if self.looks_like_zval(size, voidptr):
@@ -527,28 +531,11 @@ class Crawler(object):
 
 class HeapCrawler(object):
     def __init__(self):
-        pass
-
-
-
-class PHPHeapDiag(gdb.Command):
-    """
-    Command that scans the entire heap and performs an analysis of usage. 
-    
-    Call with no arguments. 
-      
-      (gdb) php-heap-diag
-    
-    """
-    def __init__(self):
-        gdb.Command.__init__(self, 'php-heap-diag', gdb.COMMAND_DATA) 
+        alloc_globals = gdb.selected_frame().read_var('alloc_globals')
+        self.heap = alloc_globals['mm_heap'].dereference()
 
 
     def reset_stats(self):
-        """
-        Resets the statistics stored as instance fields. Called before 
-        an invocation of the command. 
-        """
         self.block_count = 0
         self.free_block_count = 0
         self.free_space = 0
@@ -557,60 +544,21 @@ class PHPHeapDiag(gdb.Command):
         self.largest_free_block = 0
 
 
-    def invoke(self, arg, from_tty):
-        """
-        Runs the command.
-        """
-        self.reset_stats()
-
-        alloc_globals = gdb.selected_frame().read_var('alloc_globals')
-        self.heap = alloc_globals['mm_heap'].dereference()
-
-        self.visit_all_blocks()
-        self.walk_objects(self.zval_results.objects)
-
-        self.print_stats()
+    def found_objects(self):
+        return self.crawler.found_objects()
 
 
-    def print_stats(self):
-        """
-        Prints the heap statistics collected during the run. 
-        """
-        eg = gdb.selected_frame().read_var('executor_globals')
-        block_overhead = self.block_count * block_type.sizeof
-        print 'Real size:', human_size_bytes(self.heap['real_size'])
-        print 'Peak size:', human_size_bytes(self.heap['real_peak'])
-        print 'Memory limit:', human_size_bytes(self.heap['limit'])
-        print
-        print 'Block count:', self.block_count
-        print 'Free blocks:', self.free_block_count
-        print 'Free space:', human_size_bytes(self.free_space)
-        print 'Largest free block:', human_size_bytes(self.largest_free_block)
-        print 'Block header overhead:', human_size_bytes(block_overhead)
-        print 'Used blocks:', self.used_block_count
-        print 'Used space:', human_size_bytes(self.used_space)
-        print
-        print 'Object store buckets:', eg['objects_store']['size']
-        print
-        self.object_results.print_object_table()
-        self.zval_results.print_zval_table()
+    def results(self):
+        return self.crawler.accumulator
 
 
-    def walk_objects(self, objects):
-        self.crawler = Crawler()
-
-        for p in objects:
-            self.crawler.visit_object_ptr(p)
-
-        self.object_results = self.crawler.accumulator
-
-
-    def visit_all_blocks(self):
+    def crawl(self):
         """
         Walks the entire heap, collecting stats. 
         """
         self.log('Analyzing heap ')
 
+        self.reset_stats()
         self.crawler = Crawler()
 
         # The heap is implemented as a linked list of segments, each 
@@ -620,8 +568,6 @@ class PHPHeapDiag(gdb.Command):
             self.visit_segment(seg)
             seg = seg['next_segment']
             self.log('.')
-
-        self.zval_results = self.crawler.accumulator
 
         print ' done.'
         print
@@ -688,6 +634,83 @@ class PHPHeapDiag(gdb.Command):
         self.used_block_count += 1
         self.used_space += size
         return size
+
+
+    def print_stats(self):
+        block_overhead = self.block_count * block_type.sizeof
+        print 'Real size:', human_size_bytes(self.heap['real_size'])
+        print 'Peak size:', human_size_bytes(self.heap['real_peak'])
+        print 'Memory limit:', human_size_bytes(self.heap['limit'])
+        print
+        print 'Block count:', self.block_count
+        print 'Free blocks:', self.free_block_count
+        print 'Free space:', human_size_bytes(self.free_space)
+        print 'Largest free block:', human_size_bytes(self.largest_free_block)
+        print 'Block header overhead:', human_size_bytes(block_overhead)
+        print 'Used blocks:', self.used_block_count
+        print 'Used space:', human_size_bytes(self.used_space)
+        print
+        self.results().print_zval_table()
+
+
+
+class ObjectCrawler(object):
+    def __init__(self, objects):
+        self.objects = objects
+
+
+    def crawl(self):
+        self.crawler = Crawler()
+
+        for p in self.objects:
+            self.crawler.visit_object_ptr(p)
+
+
+    def results(self):
+        return self.crawler.accumulator
+
+
+    def print_stats(self):
+        eg = gdb.selected_frame().read_var('executor_globals')
+        print 'Object store buckets:', eg['objects_store']['size']
+        print
+        self.results().print_object_table()
+
+
+
+
+class PHPHeapDiag(gdb.Command):
+    """
+    Command that scans the entire heap and performs an analysis of usage. 
+    
+    Call with no arguments. 
+      
+      (gdb) php-heap-diag
+    
+    """
+    def __init__(self):
+        gdb.Command.__init__(self, 'php-heap-diag', gdb.COMMAND_DATA) 
+
+
+    def invoke(self, arg, from_tty):
+        """
+        Runs the command.
+        """
+        self.heap_crawler = HeapCrawler()
+        self.heap_crawler.crawl()
+
+        self.zval_results = self.heap_crawler.results()
+        objects = self.heap_crawler.found_objects()
+
+        self.object_crawler = ObjectCrawler(objects)
+        self.object_crawler.crawl()
+
+        self.heap_crawler.print_stats()
+        self.object_crawler.print_stats()
+
+
+
+
 
 
                     
