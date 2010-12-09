@@ -240,6 +240,10 @@ def human_size_bytes(val):
 
 class Accumulator(object):
     def __init__(self):
+        self.reset()
+
+
+    def reset(self):
         self.visited = {}
         self.object_counts = {}
         self.object_sizes = {}
@@ -260,10 +264,14 @@ class Accumulator(object):
         d[k] = d.get(k, 0) + n
 
 
+    def remember_visited_object(self, ptr, classname, size):
+        self.objects.append(ptr)
+
+
     def visited_object(self, ptr, classname, size):
         self.incr(self.object_counts, classname)
         self.incr(self.object_sizes, classname, size)
-        self.objects.append(ptr)
+        self.remember_visited_object(ptr, classname, size)
 
 
     def visited_zval(self, ptr, typename, size):
@@ -309,9 +317,31 @@ class Accumulator(object):
 
 
 
+class ClassAccumulator(Accumulator):
+    def __init__(self, classname):
+        self.classname = classname
+        Accumulator.__init__(self)
+
+
+    def reset(self):
+        Accumulator.reset(self)
+        self.sizes = {}
+
+
+    def get_size(self, ptr):
+        return self.sizes[long(ptr)]
+    
+
+    def remember_visited_object(self, ptr, classname, size):
+        if classname == self.classname:
+            Accumulator.remember_visited_object(self, ptr, classname, size)
+            self.sizes[long(ptr)] = size
+
+
+
 class Crawler(object):
-    def __init__(self):
-        self.accumulator = Accumulator()
+    def __init__(self, accumulator = None):
+        self.accumulator = accumulator or Accumulator()
         self.eg = gdb.selected_frame().read_var('executor_globals')
 
 
@@ -530,7 +560,8 @@ class Crawler(object):
 
 
 class HeapCrawler(object):
-    def __init__(self):
+    def __init__(self, accumulator = None):
+        self.accumulator = accumulator
         alloc_globals = gdb.selected_frame().read_var('alloc_globals')
         self.heap = alloc_globals['mm_heap'].dereference()
 
@@ -559,7 +590,7 @@ class HeapCrawler(object):
         self.log('Analyzing heap ')
 
         self.reset_stats()
-        self.crawler = Crawler()
+        self.crawler = Crawler(self.accumulator)
 
         # The heap is implemented as a linked list of segments, each 
         # containing a contiguous list of blocks. 
@@ -678,7 +709,6 @@ class ObjectCrawler(object):
 
 
 
-
 class PHPHeapDiag(gdb.Command):
     """
     Command that scans the entire heap and performs an analysis of usage. 
@@ -688,10 +718,6 @@ class PHPHeapDiag(gdb.Command):
       (gdb) php-heap-diag
     
     """
-    def __init__(self):
-        gdb.Command.__init__(self, 'php-heap-diag', gdb.COMMAND_DATA) 
-
-
     def invoke(self, arg, from_tty):
         """
         Runs the command.
@@ -710,9 +736,33 @@ class PHPHeapDiag(gdb.Command):
 
 
 
+class ListObjects(gdb.Command):
+    """
+    Dumps out a table listing the address of every object of a particular
+    type, along with its size. 
+    """
+    def invoke(self, classname, from_tty):
+        acc = ClassAccumulator(classname)
+        c = HeapCrawler(acc)
+        c.crawl()
+        
+        fmt = '%-30s %-10s'
+        title = fmt % ('Address', 'Size')
+        print title
+        print '-'*len(title)
+
+        xs = c.found_objects()
+        sumsizes = 0
+        for x in xs:
+            s = acc.get_size(x)
+            print fmt % (x, s)
+            sumsizes += s
+
+        print '-'*len(title)
+        print fmt % ('Total:', sumsizes)
+        print
 
 
 
-                    
-x = PHPHeapDiag()
-x.invoke('','')
+PHPHeapDiag('php-heap-diag', gdb.COMMAND_DATA)
+ListObjects('list-objects', gdb.COMMAND_DATA)
