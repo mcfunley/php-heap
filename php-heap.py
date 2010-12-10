@@ -72,7 +72,7 @@
 """
 import gdb
 import sys
-    
+import itertools
 
 
 ### The zval datatypes. 
@@ -238,6 +238,97 @@ def human_size_bytes(val):
 
 
 
+def arg_to_address(arg):
+    """
+    Returns an address, given a string argument to a gdb.Function.
+    """
+    if 'x' in arg:
+        return long(arg, 16)
+    return long(arg)
+
+
+
+class Proxy(object):
+    def __init__(self, target):
+        self.target = target
+
+    def __getattr__(self, k):
+        if not hasattr(self, k):
+            return getattr(self.target, k)
+        return object.__getattr__(self, k)
+
+
+    def __getitem__(self, k):
+        return self.target[k]
+
+
+    def __str__(self):
+        return str(self.target)
+
+
+
+class Zval(Proxy):
+    def datatype(self):
+        return datatypes.get(int(self['type']), 'unknown')
+
+
+    def get_value(self):
+        t = self.datatype()
+        v = self['value']
+        if t == 'long':
+            return long(v['lval'])
+        if t == 'double':
+            return double(v['dval'])
+        if t == 'string':
+            return v['str']['val'].string()
+        if t == 'bool':
+            return 'true' if long(v['lval']) else 'false'
+        if t == 'array':
+            # remove the 'L'
+            return hex(long(v['ht'].address))[:-1]
+        
+        return ''
+
+
+class ZendObject(Proxy):
+    def class_name(self):
+        return self['ce']['name'].string()
+
+    def iterproperties(self):
+        return hashtable_buckets(self['properties'].dereference())
+
+    
+    def field_names(self):
+        ps = self['ce']['properties_info']
+        return [charptr(b['arKey']).string() for b in hashtable_buckets(ps)]
+
+
+
+class HashtableBucket(Proxy):
+    def data_as_zval(self):
+        return zvalptr(self['pDataPtr']).dereference()
+
+
+    def key(self):
+        return self['arKey']
+
+    
+    def index(self):
+        return self['h']
+
+
+def hashtable_buckets(ht):
+    """
+    Given a hashtable, returns an iterator over its buckets. 
+    """
+    bp = ht['pListHead']
+    while bp != 0:
+        b = HashtableBucket(bp.dereference())
+        yield b
+        bp = b['pListNext']
+
+
+
 class Accumulator(object):
     def __init__(self):
         self.reset()
@@ -287,29 +378,25 @@ class Accumulator(object):
         self.print_counts('instances', self.object_counts, self.object_sizes)
 
 
-    def print_counts(self, label, counts, sizes = None):
+    def print_counts(self, label, counts, sizes):
         """
         Prints out a table given dictionaries of counts and total sizes. 
         The keys in the two dictionaries should match. The sizes are optional.
         The label parameter indicates what the keys represents. 
         """
-        if not sizes:
-            sizes = {}
-
         fmt = '%-40s%-10s  %-10s'
         print fmt % (label, 'count', 'size')
         print fmt % (len(label)*'-', '-----', '----')
 
-        cs = [(n, c) for n, c in counts.items()]
+        ss = [(n, s) for n, s in sizes.items()]
 
         csum, ssum = 0, 0
-        for n, c in reversed(sorted(cs, key=lambda (_, c): c)):
-            size = sizes.get(n, -1)
-            csum += c
-            ssum += max(size, 0)
+        for n, size in reversed(sorted(ss, key=lambda (_, s): s)):
+            count = counts[n]
+            csum += count
+            ssum += size
             size = human_size_bytes(size) if size > 0 else ''
-
-            print fmt % (n, c, size)
+            print fmt % (n, count, size)
             
         print fmt % ('', '-'*10, '-'*10)
         print fmt % ('Total:', csum, human_size_bytes(ssum))
@@ -410,7 +497,8 @@ class Crawler(object):
         if self.accumulator.have_visited(zval.address):
             return 0
 
-        datatype = datatypes.get(int(zval['type']), 'unknown')
+        z = Zval(zval)
+        datatype = z.datatype()
 
         zs = zval_type.sizeof
         if datatype == 'object':
@@ -488,18 +576,9 @@ class Crawler(object):
         bpsize = bucketptr_type.sizeof
         s += nTableSize * bpsize
 
-        bp = ht['pListHead']
-        while bp != 0:
-            b = bp.dereference()
-
-            # The key is stored immediately after the bucket; we have to account
-            # for the sentinel char at the end of the struct. 
+        for b in hashtable_buckets(ht):
             s += bucket_type.sizeof - char_type.sizeof + b['nKeyLength']
-
-            zval = zvalptr(b['pDataPtr']).dereference()
-            s += self.visit_zval(zval)
-
-            bp = b['pListNext']
+            s += self.visit_zval(b.data_as_zval())
         
         return long(s)
 
@@ -534,12 +613,10 @@ class Crawler(object):
         if self.accumulator.have_visited(zend_object_ptr):
             return 0
 
-        ce = zend_object_ptr.dereference()['ce']
-        name = ce['name'].string()
-        
         s = self.size_zend_object_ptr(zend_object_ptr)
 
-        self.accumulator.visited_object(zend_object_ptr, name, s)
+        z = ZendObject(zend_object_ptr.dereference())
+        self.accumulator.visited_object(zend_object_ptr, z.class_name(), s)
         return s
 
 
@@ -755,14 +832,34 @@ class ListObjects(gdb.Command):
         sumsizes = 0
         for x in xs:
             s = acc.get_size(x)
-            print fmt % (x, s)
+            print fmt % (x, human_size_bytes(s))
             sumsizes += s
 
         print '-'*len(title)
-        print fmt % ('Total:', sumsizes)
+        print fmt % ('%d instances' % len(xs), human_size_bytes(sumsizes))
         print
 
 
 
-PHPHeapDiag('php-heap-diag', gdb.COMMAND_DATA)
-ListObjects('list-objects', gdb.COMMAND_DATA)
+class DumpObject(gdb.Command):
+    def invoke(self, address, from_tty):
+        address = arg_to_address(address)
+        z = ZendObject(objptr(voidptr(gdb.Value(address))).dereference())
+        
+        fmt = '%-3s %-30s %-10s  %s' 
+        print 'Type:', z.class_name()
+        print
+        print fmt % ('', 'name', 'type', 'value')
+        print '-'*80
+        for i, n, b in zip(itertools.count(1),
+                           z.field_names(), 
+                           z.iterproperties()):
+            z = Zval(b.data_as_zval())
+            print fmt % (i, n, z.datatype(), z.get_value())
+
+
+
+group = gdb.COMMAND_DATA
+PHPHeapDiag('php-heap-diag', group)
+ListObjects('list-objects', group)
+DumpObject('dump-object', group)
