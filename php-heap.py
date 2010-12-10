@@ -110,6 +110,10 @@ object_type = gdb.lookup_type('zend_object')
 objectptr_type = object_type.pointer()
 def objptr(x): return x.cast(objectptr_type)
 
+classentry_type = gdb.lookup_type('zend_class_entry')
+classentryptr_type = classentry_type.pointer()
+def classentryptr(x): return x.cast(classentry_type)
+
 zval_type = gdb.lookup_type('zval')
 zvalptr_type = zval_type.pointer()
 def zvalptr(x): return x.cast(zvalptr_type)
@@ -231,10 +235,12 @@ def human_size_bytes(val):
     """
     Returns a human-legible string for the given byte count. 
     """
-    for x in [' bytes','KB','MB','GB',]:
+    if val < 1024:
+        return "%s bytes" % val
+    for x in ['KB','MB','GB',]:
+        val /= 1024.0
         if val < 1024.0:
             return "%3.1f%s" % (float(val), x)
-        val /= 1024.0
 
 
 
@@ -272,6 +278,20 @@ class Zval(Proxy):
         return datatypes.get(int(self['type']), 'unknown')
 
 
+    def display_type(self):
+        t = self.datatype()
+        if t == 'array':
+            ht = Hashtable(self['value']['ht'].dereference())
+            return 'array[%d]' % ht.size()
+        if t == 'object':
+            return ZendObject(self.get_objectptr()).class_name()
+        return t
+
+
+    def get_objectptr(self):
+        return ObjectHandle(self['value']['obj']['handle']).get_objectptr()
+        
+
     def get_value(self):
         t = self.datatype()
         v = self['value']
@@ -286,13 +306,59 @@ class Zval(Proxy):
         if t == 'array':
             # remove the 'L'
             return hex(long(v['ht'].address))[:-1]
-        
+        if t == 'object':
+            return hex(long(self.get_objectptr()))[:-1]
+        if t == 'null':
+            return '-'
         return ''
 
 
+    def get_size(self):
+        c = Crawler()
+        return c.visit_zval(self.target)
+        
+
+class ZendClass(Proxy):
+    def name(self):
+        return self['name'].string()
+
+
+    def superclasses(self):
+        pce = self['parent']
+        ret = []
+        while long(pce) != 0:
+            ce = pce.dereference()
+            ret.append(ZendClass(ce))
+            pce = ce['parent']
+        return ret
+
+    
+
 class ZendObject(Proxy):
+    def __init__(self, *args, **kwargs):
+        Proxy.__init__(self, *args, **kwargs)
+        self.cls = ZendClass(self['ce'])
+
+
     def class_name(self):
-        return self['ce']['name'].string()
+        return self.cls.name()
+
+
+    def superclasses(self):
+        return self.cls.superclasses()
+
+
+    def filename(self):
+        return self['ce']['filename'].string()
+
+
+    def line_start(self):
+        return int(self['ce']['line_start'])
+
+
+    def line_end(self):
+        return int(self['ce']['line_end'])
+
 
     def iterproperties(self):
         return hashtable_buckets(self['properties'].dereference())
@@ -301,6 +367,35 @@ class ZendObject(Proxy):
     def field_names(self):
         ps = self['ce']['properties_info']
         return [charptr(b['arKey']).string() for b in hashtable_buckets(ps)]
+
+
+
+class ObjectHandle(object):
+    eg = None
+
+    def __init__(self, handle):
+        self.handle = long(handle)
+
+        if ObjectHandle.eg is None:
+            ObjectHandle.eg = gdb.selected_frame().read_var('executor_globals')
+        
+        self.store = self.eg['objects_store']
+        
+
+    def get_objectptr(self):
+        # The handle is used as a simple offset in a global object table, kept
+        # in the executor_globals. The entry in the table has the pointer.
+        if self.handle < 0 or self.handle > long(self.store['size']):
+            return None
+        buckets = self.store['object_buckets']
+        bucket = (buckets + self.handle).dereference()['bucket']
+        return objptr(bucket['obj']['object'])
+
+
+
+class Hashtable(Proxy):
+    def size(self):
+        return int(self['nNumOfElements'])
 
 
 
@@ -588,19 +683,7 @@ class Crawler(object):
         Gets a zend_object* given a zend_object_value structure. (The struct 
         contains an object handle that has to be mapped to the real address.)
         """
-        # The handle is used as a simple offset in a global object table, kept
-        # in the executor_globals. The entry in the table has the pointer.
-        handle = int(zobj['handle'])
-        store = self.eg['objects_store']
-
-        h = long(handle)
-        if h < 0 or h > long(store['size']):
-            return None
-
-        buckets = store['object_buckets']
-        bucket = (buckets + handle).dereference()['bucket']
-        p = objptr(bucket['obj']['object'])
-        return p
+        return ObjectHandle(zobj['handle']).get_objectptr()
 
 
     def visit_object_value(self, zobj):
@@ -846,16 +929,21 @@ class DumpObject(gdb.Command):
         address = arg_to_address(address)
         z = ZendObject(objptr(voidptr(gdb.Value(address))).dereference())
         
-        fmt = '%-3s %-30s %-10s  %s' 
+        fmt = '%-3s %-30s %-40s  %-30s %s' 
+        title = fmt % ('', 'name', 'type', 'value', 'size')
         print 'Type:', z.class_name()
+        print 'Declared: %s %s:%s' % (z.filename(), z.line_start(), z.line_end())
+        print 'Superclasses:', ', '.join([c.name() for c in z.superclasses()])
         print
-        print fmt % ('', 'name', 'type', 'value')
-        print '-'*80
+        print title
+        print '-'*(len(title) + 10)
         for i, n, b in zip(itertools.count(1),
                            z.field_names(), 
                            z.iterproperties()):
             z = Zval(b.data_as_zval())
-            print fmt % (i, n, z.datatype(), z.get_value())
+            s = human_size_bytes(z.get_size())
+            print fmt % (i, n, z.display_type(), z.get_value(), s)
+        print
 
 
 
