@@ -305,7 +305,7 @@ class Zval(Proxy):
             return 'true' if long(v['lval']) else 'false'
         if t == 'array':
             # remove the 'L'
-            return hex(long(v['ht'].address))[:-1]
+            return hex(long(v['ht']))[:-1]
         if t == 'object':
             return hex(long(self.get_objectptr()))[:-1]
         if t == 'null':
@@ -405,7 +405,7 @@ class HashtableBucket(Proxy):
 
 
     def key(self):
-        return self['arKey']
+        return charptr(self['arKey'].address).string()
 
     
     def index(self):
@@ -924,25 +924,42 @@ class ListObjects(gdb.Command):
 
 
 
+dump_format = fmt = '%-3s %-30s %-40s  %-30s %s' 
+dump_title = fmt % ('', 'name', 'type', 'value', 'size')
+dump_line = '-' * (len(dump_title)+10)
+
+
+class DumpArray(gdb.Command):
+    def invoke(self, address, from_tty):
+        address = arg_to_address(address)
+        ht = hashtableptr(voidptr(gdb.Value(address))).dereference()
+
+        print dump_title
+        print dump_line
+        for i, b in zip(itertools.count(1), hashtable_buckets(ht)):
+            z = Zval(b.data_as_zval())
+            s = human_size_bytes(z.get_size())
+            print dump_format % (i, b.key(), z.display_type(), z.get_value(), s)
+        print
+
+
 class DumpObject(gdb.Command):
     def invoke(self, address, from_tty):
         address = arg_to_address(address)
         z = ZendObject(objptr(voidptr(gdb.Value(address))).dereference())
         
-        fmt = '%-3s %-30s %-40s  %-30s %s' 
-        title = fmt % ('', 'name', 'type', 'value', 'size')
         print 'Type:', z.class_name()
         print 'Declared: %s %s:%s' % (z.filename(), z.line_start(), z.line_end())
         print 'Superclasses:', ', '.join([c.name() for c in z.superclasses()])
         print
-        print title
-        print '-'*(len(title) + 10)
+        print dump_title
+        print dump_line
         for i, n, b in zip(itertools.count(1),
                            z.field_names(), 
                            z.iterproperties()):
             z = Zval(b.data_as_zval())
             s = human_size_bytes(z.get_size())
-            print fmt % (i, n, z.display_type(), z.get_value(), s)
+            print dump_format % (i, n, z.display_type(), z.get_value(), s)
         print
 
 
@@ -951,3 +968,4 @@ group = gdb.COMMAND_DATA
 PHPHeapDiag('php-heap-diag', group)
 ListObjects('list-objects', group)
 DumpObject('dump-object', group)
+DumpArray('dump-array', group)
