@@ -4,6 +4,7 @@ Overview
 This is a gdb extension that can be used for examining the objects in memory in a running PHP process or core dump. It walks the low-level PHP memory structures to do this and should work without code modifications. 
 
 By Dan McKinley, 2010
+
 [http://mcfunley.com](http://mcfunley.com)
 
 
