@@ -47,7 +47,7 @@ After you have done this there are a number of commands at your disposal:
 
 If you are debugging a script that eventually runs out of memory, try setting a breakpoint on the function that raises the error:
 
-   (gdb) break zend_mm_safe_error
+    (gdb) break zend_mm_safe_error
 
 Then running the analysis.
 
